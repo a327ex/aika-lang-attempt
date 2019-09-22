@@ -85,6 +85,12 @@ local function contains(t, v)
     if v == u then return true end
   end
 end
+
+local function copy(t)
+  local out = {}
+  for k, v in pairs(t) do out[k] = v end
+  return out
+end
 --}}}
 
 local function transform_update_assignment(line, assignment_type, transformed_lines)
@@ -141,19 +147,33 @@ local function transform_function_declaration_arguments(line, transformed_lines)
     end
     if #params > 0 then function_lines[1] = function_lines[1]:sub(1, -3) end
     function_lines[1] = function_lines[1] .. ")"
-    table.insert(function_lines, "")
     return function_lines
   end
 
-  local indentation = line:match("(%s*)function%(") or ""
   if line:find("function%((.*)%[\r\n]*$") then
     local params = tokenize_function_parameters(split(line:match("function%((.*)%)"), "%,"))
-    local lines = transform("function(", params)
+    local indentation = ""
+    local lines
+    if line:find("self%.") then 
+      lines = transform("self.function(", params)
+      indentation = line:match("(%s*)self%.function%(")
+    else 
+      lines = transform("function(", params) 
+      indentation = line:match("(%s*)function%(")
+    end
     for _, line in ipairs(lines) do table.insert(transformed_lines, indentation .. line) end
   elseif line:find("function %S+%((.*)%)") then
     local params = tokenize_function_parameters(split(line:match("function %S+%((.*)%)"), "%,"))
-    local lines = transform("function " .. line:match("function (%S+)%(") .. "(", params)
-    for _, line in ipairs(lines) do table.insert(transformed_lines, indentation .. line) end
+    local indentation = ""
+    local lines
+    if line:find("self%.") then 
+      lines = transform("self.function " .. line:match("function (%S+)%(") .. "(", params)
+      indentation = line:match("(%s*)self%.function %S+%(")
+    else 
+      lines = transform("function " .. line:match("function (%S+)%(") .. "(", params) 
+      indentation = line:match("(%s*)function %S+%(")
+    end
+    for _, line in ipairs(lines) do table.insert(transformed_lines, indentation:sub(1, -2) .. line) end
   end
 end
 
@@ -176,13 +196,22 @@ local function transform_with(i, j, lines, context)
   end
 end
 
-local function transform_switch(i, j, lines, transformed_lines, context)
+local function transform_switch(i, j, lines, context)
   local line = lines[i]
   if line:find("%s*switch%s*(.*)") then
     local indentation, tail = line:match("(%s*)switch%s*(.*)")
     local var_name = "exp_" .. get_uid()
-    table.insert(transformed_lines, indentation .. "local " .. var_name .. "= " .. tail)
-    table.insert(context.switchs, {i+1, j, var_name})
+    table.insert(context.lines, indentation .. "local " .. var_name .. "= " .. tail)
+    table.insert(context.switchs, {i+1, j, var_name, true})
+  end
+end
+
+local function transform_class(i, j, lines, context)
+  local line = lines[i]
+  if line:find("%s*class%s*(.*)") then
+    local indentation, tail = line:match("(%s*)class%s*(.*)")
+    table.insert(context.lines, tail .. " = Class:extend()")
+    table.insert(context.classes, {i+1, j, tail})
   end
 end
 
@@ -234,7 +263,7 @@ local function transform_blocks(lines)
         line = line:gsub(" %.", " " .. with[3] .. ".")
         line = line:gsub(" %:", " " .. with[3] .. ":")
         line = line:gsub(" %\\", " " .. with[3] .. ":")
-        table.insert(transformed_lines, line)
+        table.insert(context.lines, line)
         modified = true
       end
     end
@@ -246,11 +275,67 @@ local function transform_blocks(lines)
     if not modified then table.insert(context.lines, line) end
   end
 
-  lines = copy(context.lines)
-
   -- handle switches
+  lines = copy(context.lines)
+  context.lines = {}
+  context.switchs = {}
+  for i, line in ipairs(lines) do
+    local modified = false
+    for _, switch in ipairs(context.switchs) do
+      if i >= switch[1] and i <= switch[2] then
+        if line:find("%s*when%s*%S+") then
+          local indentation, exp = line:match("(%s*)when%s*(%S+)")
+          indentation = indentation:sub(1, -3)
+          if switch[4] then
+            table.insert(context.lines, indentation .. "if " .. switch[3] .. "== " .. exp .. " then")
+            switch[4] = false
+          else table.insert(context.lines, indentation .. "elseif " .. switch[3] .. "== " .. exp .. " then") end
+          modified = true
+        else
+          if i < switch[2] then
+            local indentation, exp = line:match("(%s*)(.*)")
+            table.insert(context.lines, indentation:sub(1, -3) .. exp)
+            modified = true
+          end
+        end
+      end
+    end
+    for _, block in ipairs(blocks) do
+      if i == block[1] then
+        if line:find("%s*switch%s+(.*)") then transform_switch(block[1], block[2], lines, context); modified = true end
+      end
+    end
+    if not modified then table.insert(context.lines, line) end
+  end
 
-  --      if line:find("%s*switch%s+(.*)") then transform_switch(block[1], block[2], lines, transformed_lines, context); modified = true end
+  -- handle class
+  lines = copy(context.lines)
+  context.lines = {}
+  context.classes = {}
+  for i, line in ipairs(lines) do
+    local modified = false
+    for _, class in ipairs(context.classes) do
+      if i >= class[1] and i <= class[2] then
+        if line:find("self%.function ") then
+          local indentation, function_name = line:match("(%s*)self%.function (%S+)")
+          line = line:gsub("self%.function (%S+)%(", "function " .. class[3] .. ":%1(")
+          table.insert(context.lines, indentation .. line)
+          modified = true
+        end
+      end
+      if i == class[2] then
+        modified = true
+      end
+    end
+    for _, block in ipairs(blocks) do
+      if i == block[1] then
+        if line:find("%s*class%s*(.*)") then transform_class(block[1], block[2], lines, context); modified = true end
+      end
+    end
+    if not modified then table.insert(context.lines, line) end
+  end
+
+  return context.lines
 end
 
 -- Transforms lines that introduce new lines or need more context before changes can be made
@@ -282,8 +367,9 @@ local function transform_line_simple(line, transformed_lines)
   if line:find("%!") then line = line:gsub("%!", "()") end -- ! -> no parameter function call
   if line:find("fn") then line = line:gsub("fn", "function") end -- function
   if line:find("for (%S+) in %*(%S+)") then line = line:gsub("for (%S+) in %*(%S+)", "for _, %1 in ipairs(%2)") end -- * -> ipairs
+  if line:find("for (%S+)%,%s*(%S+) in %*(%S+)") then line = line:gsub("for (%S+)%,%s*(%S+) in %*(%S+)", "for %1, %2 in ipairs(%3)") end -- * -> ipairs
   if line:find("for (%S+)%,%s*(%S+) in %&(%S+)") then line = line:gsub("for (%S+)%,%s*(%S+) in %&(%S+)", "for %1, %2 in pairs(%3)") end -- & -> pairs
-  if line:find("for (.*)") then line = line:gsub("for (.*)", "for %1 do") end -- for
+  if line:find("for (.*)") and not line:find("for (.*) do") then line = line:gsub("for (.*)", "for %1 do") end -- for
   if line:find("(%s*)(.+) if (.*)[\r\n]*$") then line = line:gsub("(%s*)(.*) if (.*)[\r\n]*$", "%1 if %3 then %2 end") end -- if decorator
   if line:find("(%s*)if (.*) then (%s*) end[\r\n]*$") then line = line:gsub("(.*)if (.*) then (%s*) end[\r\n]*$", "%1if %2 then") end -- if fix
   if line:find("elseif (.*)[\r\n]*$") then line = line:gsub("elseif (.*)[\r\n]*$", "elseif %1 then") end -- elseif
@@ -292,17 +378,21 @@ local function transform_line_simple(line, transformed_lines)
 end
 
 local function transform_file(path)
+  if not path:find("%.aika") then return end
   local lines = {}
   for line in love.filesystem.lines(path) do table.insert(lines, line) end
   local transformed_lines_simple = {}; for i = 1, #lines do transform_line_simple(lines[i], transformed_lines_simple) end
   local transformed_lines_complex = {}; for i = 1, #transformed_lines_simple do transform_line_complex(transformed_lines_simple[i], transformed_lines_complex) end
   local transformed_lines_blocks = transform_blocks(transformed_lines_complex)
-  str = ""; for _, line in ipairs(transformed_lines_blocks) do str = str .. line .. "\n" end
-  print(str)
+  local source = love.filesystem.getSource()
+  path = path:gsub("%.aika", ".lua")
+  local file = io.open(source .. "/" .. path, "w")
+  for _, line in ipairs(transformed_lines_blocks) do file:write(line .. "\n") end
+  file:close()
 end
 
 function transform()
-  local paths = enumerate_files("src")
+  local paths = enumerate_files("aika")
   for _, path in ipairs(paths) do
     transform_file(path)
   end

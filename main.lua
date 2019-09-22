@@ -1,6 +1,6 @@
 
 function love.run()
-  require "aika"; transform()
+  require "lang"; transform()
 
   if love.timer then love.timer.step() end
 
